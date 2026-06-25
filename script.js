@@ -364,3 +364,5 @@ document.addEventListener('DOMContentLoaded', () => {
     // Apply basic language rules execution upon initial evaluation runtime load
     applyLocalization();
 });
+const express = require('express');
+const app = express();
