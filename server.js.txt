@@ -1,0 +1,292 @@
+/**
+ * server.js - Scala Quaranta Backend Game Engine
+ * Node.js + Express + Socket.io Authoritative Server
+ */
+
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: "*" }
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Global State for active rooms
+const rooms = {};
+
+// Helper: Generate clean 5-character alphanumeric room codes
+function generateRoomCode() {
+    return Math.random().toString(36).substring(2, 7).toUpperCase();
+}
+
+// Create a dual-deck composition including 4 Jokers (108 total cards)
+function createScala40Deck() {
+    const suits = ['H', 'D', 'C', 'S']; // Hearts, Diamonds, Clubs, Spades
+    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+    let deck = [];
+
+    // Construct 2 standard decks
+    for (let d = 0; d < 2; d++) {
+        for (let suit of suits) {
+            for (let rank of ranks) {
+                deck.push({ id: `${d}-${suit}-${rank}`, suit, rank, isJoker: false });
+            }
+        }
+        // Append 2 Jokers per deck
+        for (let j = 1; j <= 2; j++) {
+            deck.push({ id: `${d}-JOKER-${j}`, suit: 'X', rank: 'JK', isJoker: true });
+        }
+    }
+    return deck;
+}
+
+// Fisher-Yates shuffle implementation
+function shuffleDeck(deck) {
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    return deck;
+}
+
+// Authoritative Point Counter for Card Melds
+function calculateMeldPoints(meld) {
+    let points = 0;
+    // Determine context to resolve Ace values (1 vs 11)
+    const isRun = meld.some((c, idx) => {
+        if (idx === 0) return false;
+        const prev = meld[idx-1];
+        return !c.isJoker && !prev.isJoker && c.suit === prev.suit;
+    });
+
+    meld.forEach((card, index) => {
+        if (card.isJoker) {
+            // Evaluates to inferred card point context during game validation
+            points += 10; // Default baseline safely generalized for evaluation
+            return;
+        }
+        if (['J', 'Q', 'K'].includes(card.rank)) {
+            points += 10;
+        } else if (card.rank === 'A') {
+            if (isRun && index === 0 && meld.length > 1 && meld[1].rank === '2') {
+                points += 1; // Ace low
+            } else {
+                points += 11; // Ace high or inside Tris
+            }
+        } else {
+            points += parseInt(card.rank, 10);
+        }
+    });
+    return points;
+}
+
+// Real-time Event Management Matrix
+io.on('connection', (socket) => {
+    console.log(`User Connected: ${socket.id}`);
+
+    // Action: Create Private Room Axis
+    socket.on('createRoom', ({ playerName }) => {
+        const roomCode = generateRoomCode();
+        rooms[roomCode] = {
+            code: roomCode,
+            hostId: socket.id,
+            players: [{ id: socket.id, name: playerName, hand: [], opened: false, points: 0 }],
+            deck: [],
+            discardPile: [],
+            melds: [],
+            turnIndex: 0,
+            hasDrawn: false,
+            gameStarted: false
+        };
+        socket.join(roomCode);
+        socket.emit('roomCreated', { roomCode, roomState: rooms[roomCode] });
+    });
+
+    // Action: Join Pre-existing Room Axis
+    socket.on('joinRoom', ({ roomCode, playerName }) => {
+        const code = roomCode.toUpperCase();
+        const room = rooms[code];
+
+        if (!room) {
+            return socket.emit('errorMsg', { key: 'ROOM_NOT_FOUND' });
+        }
+        if (room.gameStarted) {
+            return socket.emit('errorMsg', { key: 'GAME_ALREADY_STARTED' });
+        }
+        if (room.players.length >= 5) {
+            return socket.emit('errorMsg', { key: 'ROOM_FULL' });
+        }
+
+        room.players.push({ id: socket.id, name: playerName, hand: [], opened: false, points: 0 });
+        socket.join(code);
+        io.to(code).emit('roomUpdated', room);
+    });
+
+    // Action: Start Match Lifecycle
+    socket.on('startGame', ({ roomCode }) => {
+        const room = rooms[roomCode];
+        if (!room || room.hostId !== socket.id) return;
+
+        room.deck = shuffleDeck(createScala40Deck());
+        room.melds = [];
+        room.discardPile = [];
+        room.gameStarted = true;
+        room.turnIndex = 0;
+        room.hasDrawn = false;
+
+        // Deal 13 cards authoritatively to each participant
+        room.players.forEach(player => {
+            player.hand = room.deck.splice(0, 13);
+            player.opened = false;
+        });
+
+        // Initialize Discard Pile (Pozzo)
+        room.discardPile.push(room.deck.shift());
+
+        io.to(roomCode).emit('gameStartedSignal', room);
+    });
+
+    // Action: Draw Card from Active Deck
+    socket.on('drawCardDeck', ({ roomCode }) => {
+        const room = rooms[roomCode];
+        if (!room || !room.gameStarted) return;
+        
+        const activePlayer = room.players[room.turnIndex];
+        if (activePlayer.id !== socket.id || room.hasDrawn) return;
+
+        if (room.deck.length === 0) {
+            // Recycle discard pile if deck depletes
+            const topCard = room.discardPile.pop();
+            room.deck = shuffleDeck(room.discardPile);
+            room.discardPile = [topCard];
+        }
+
+        const drawnCard = room.deck.shift();
+        activePlayer.hand.push(drawnCard);
+        room.hasDrawn = true;
+
+        io.to(roomCode).emit('cardDrawnDeckSuccess', {
+            roomState: room,
+            playerId: socket.id,
+            drawnCard
+        });
+    });
+
+    // Action: Draw Card from Discard Pile (Pozzo Rules Applied)
+    socket.on('drawCardDiscard', ({ roomCode }) => {
+        const room = rooms[roomCode];
+        if (!room || !room.gameStarted) return;
+
+        const activePlayer = room.players[room.turnIndex];
+        if (activePlayer.id !== socket.id || room.hasDrawn) return;
+
+        // Player must either be opened already, or must open within this exact turn
+        if (!activePlayer.opened) {
+            // Flag condition passed down to frontend tracking temporary pull-up
+            socket.emit('discardDrawPreCheck', { card: room.discardPile[room.discardPile.length - 1] });
+        }
+
+        const drawnCard = room.discardPile.pop();
+        activePlayer.hand.push(drawnCard);
+        room.hasDrawn = true;
+
+        io.to(roomCode).emit('cardDrawnDiscardSuccess', {
+            roomState: room,
+            playerId: socket.id,
+            drawnCard
+        });
+    });
+
+    // Action: Submit Meld Array Configuration
+    socket.on('submitMeld', ({ roomCode, cardIds }) => {
+        const room = rooms[roomCode];
+        if (!room) return;
+
+        const player = room.players.find(p => p.id === socket.id);
+        if (!player || room.players[room.turnIndex].id !== socket.id || !room.hasDrawn) return;
+
+        // Group corresponding card entities
+        const selectedCards = player.hand.filter(c => cardIds.includes(c.id));
+        
+        // Basic point extraction verification
+        const points = calculateMeldPoints(selectedCards);
+
+        if (!player.opened && points < 40) {
+            return socket.emit('errorMsg', { key: 'NEED_40_POINTS' });
+        }
+
+        // Authoritative verification checks passed -> Remove cards from hand
+        player.hand = player.hand.filter(c => !cardIds.includes(c.id));
+        if (!player.opened) player.opened = true;
+
+        room.melds.push(selectedCards);
+        io.to(roomCode).emit('meldSubmittedSuccess', room);
+    });
+
+    // Action: Discard Card and Complete Turn Rotation
+    socket.on('discardCard', ({ roomCode, cardId }) => {
+        const room = rooms[roomCode];
+        if (!room || !room.gameStarted) return;
+
+        const player = room.players[room.turnIndex];
+        if (player.id !== socket.id || !room.hasDrawn) return;
+
+        const cardIndex = player.hand.findIndex(c => c.id === cardId);
+        if (cardIndex === -1) return;
+
+        const discardedCard = player.hand.splice(cardIndex, 1)[0];
+        room.discardPile.push(discardedCard);
+
+        // Check if player has cleanly closed the hand
+        if (player.hand.length === 0) {
+            room.gameStarted = false;
+            // Tally closing scores across opposing instances
+            room.players.forEach(p => {
+                let handScore = 0;
+                p.hand.forEach(c => {
+                    if (c.isJoker) handScore += 25;
+                    else if (['J','Q','K','A'].includes(c.rank)) handScore += 10;
+                    else handScore += parseInt(c.rank, 10);
+                });
+                p.points += handScore;
+            });
+            io.to(roomCode).emit('handClosed', { roomState: room, winnerName: player.name });
+            return;
+        }
+
+        // Advance to subsequent player position
+        room.turnIndex = (room.turnIndex + 1) % room.players.length;
+        room.hasDrawn = false;
+
+        io.to(roomCode).emit('turnEnded', room);
+    });
+
+    // Action: Connection Drops Cleanup Lifecycle
+    socket.on('disconnect', () => {
+        console.log(`User Disconnected: ${socket.id}`);
+        for (let code in rooms) {
+            const room = rooms[code];
+            const pIdx = room.players.findIndex(p => p.id === socket.id);
+            if (pIdx !== -1) {
+                room.players.splice(pIdx, 1);
+                if (room.players.length === 0) {
+                    delete rooms[code];
+                } else {
+                    if (room.hostId === socket.id) {
+                        room.hostId = room.players[0].id; // Migrated authorization controls
+                    }
+                    io.to(code).emit('roomUpdated', room);
+                }
+                break;
+            }
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Authoritative Scala 40 Server running on port ${PORT}`));

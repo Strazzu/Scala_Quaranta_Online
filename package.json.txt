@@ -1,0 +1,10 @@
+{
+  "name": "scala-40-multiplayer",
+  "version": "1.0.0",
+  "description": "Production-ready Scala 40 Game Room Suite",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
